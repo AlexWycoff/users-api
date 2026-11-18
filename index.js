@@ -1,92 +1,114 @@
-import 'dotenv/config' // loads the values from .env into process.env
+import 'dotenv/config'
 import express from 'express'
 import cors from 'cors'
-import pg from 'pg'
+import { createClient } from '@supabase/supabase-js'
 
-const { Pool } = pg
-
-// Connect to the Postgres database on Render
-const pool = new Pool({
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT,
-  database: process.env.DB_NAME,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  ssl: { rejectUnauthorized: false }, // Render requires SSL for outside connections
-})
+// Connect to Supabase. 
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY)
 
 const app = express()
-app.use(cors()) // lets the React app (on a different port) call this API
-app.use(express.json()) // lets us read JSON request bodies
+app.use(cors()) 
+app.use(express.json())
 
-// GET /users: return every user in the database
+// GET /users: return every user
 app.get('/users', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT * FROM users ORDER BY id')
-    res.json(result.rows)
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ error: 'Failed to fetch users' })
+  const { data, error } = await supabase.from('users').select('*').order('id')
+  if (error) {
+    console.error(error)
+    return res.status(500).json({ error: 'Failed to fetch users' })
   }
+  res.json(data)
 })
 
-// POST /users: add a new user
+// GET /users/profiles: every user joined with their profile
+app.get('/users/profiles', async (req, res) => {
+  const { data, error } = await supabase.from('users').select('*, user_profiles(*)').order('id')
+  if (error) {
+    console.error(error)
+    return res.status(500).json({ error: 'Failed to fetch user profiles' })
+  }
+  res.json(data)
+})
+
+// POST /users: add a new user and their profile
 app.post('/users', async (req, res) => {
-  const { first_name, last_name, email, bio, major, graduation_year, profile_picture_url } = req.body
-  try {
-    const result = await pool.query(
-      `INSERT INTO users (first_name, last_name, email, bio, major, graduation_year, profile_picture_url)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       RETURNING *`,
-      [first_name, last_name, email, bio, major, graduation_year, profile_picture_url]
-    )
-    res.status(201).json(result.rows[0])
-  } catch (err) {
-    console.error(err)
-    if (err.code === '23505') {
+  const { first_name, last_name, email, major, graduation_year } = req.body
+  const { bio, date_of_birth, profile_picture_url } = req.body
+
+  const { data: user, error } = await supabase
+    .from('users')
+    .insert({ first_name, last_name, email, major, graduation_year })
+    .select()
+    .single()
+
+  if (error) {
+    console.error(error)
+    if (error.code === '23505') {
       return res.status(400).json({ error: 'A user with that email already exists' })
     }
-    res.status(500).json({ error: 'Failed to create user' })
+    return res.status(500).json({ error: 'Failed to create user' })
   }
+
+  // The profile uses the same id as the user (one-to-one)
+  const { error: profileError } = await supabase
+    .from('user_profiles')
+    .insert({ id: user.id, bio, date_of_birth, profile_picture_url })
+
+  if (profileError) {
+    console.error(profileError)
+    return res.status(500).json({ error: 'User created, but failed to create profile' })
+  }
+
+  res.status(201).json(user)
 })
 
-// PUT /users/:id: update an existing user
+// PUT /users/:id: update a user and their profile
 app.put('/users/:id', async (req, res) => {
-  const { first_name, last_name, email, bio, major, graduation_year, profile_picture_url } = req.body
-  try {
-    const result = await pool.query(
-      `UPDATE users
-       SET first_name = $1, last_name = $2, email = $3, bio = $4,
-           major = $5, graduation_year = $6, profile_picture_url = $7
-       WHERE id = $8
-       RETURNING *`,
-      [first_name, last_name, email, bio, major, graduation_year, profile_picture_url, req.params.id]
-    )
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' })
-    }
-    res.json(result.rows[0])
-  } catch (err) {
-    console.error(err)
-    if (err.code === '23505') {
+  const id = req.params.id
+  const { first_name, last_name, email, major, graduation_year } = req.body
+  const { bio, date_of_birth, profile_picture_url } = req.body
+
+  const { data, error } = await supabase
+    .from('users')
+    .update({ first_name, last_name, email, major, graduation_year })
+    .eq('id', id)
+    .select()
+
+  if (error) {
+    console.error(error)
+    if (error.code === '23505') {
       return res.status(400).json({ error: 'A user with that email already exists' })
     }
-    res.status(500).json({ error: 'Failed to update user' })
+    return res.status(500).json({ error: 'Failed to update user' })
   }
+  if (data.length === 0) {
+    return res.status(404).json({ error: 'User not found' })
+  }
+
+  // upsert = update the profile if it exists, otherwise create it
+  const { error: profileError } = await supabase
+    .from('user_profiles')
+    .upsert({ id, bio, date_of_birth, profile_picture_url })
+
+  if (profileError) {
+    console.error(profileError)
+    return res.status(500).json({ error: 'User updated, but failed to update profile' })
+  }
+
+  res.json(data[0])
 })
 
-// DELETE /users/:id: remove a user
+// DELETE /users/:id: remove a user (their profile and posts are removed too, by ON DELETE CASCADE)
 app.delete('/users/:id', async (req, res) => {
-  try {
-    const result = await pool.query('DELETE FROM users WHERE id = $1 RETURNING id', [req.params.id])
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'User not found' })
-    }
-    res.status(204).send()
-  } catch (err) {
-    console.error(err)
-    res.status(500).json({ error: 'Failed to delete user' })
+  const { data, error } = await supabase.from('users').delete().eq('id', req.params.id).select()
+  if (error) {
+    console.error(error)
+    return res.status(500).json({ error: 'Failed to delete user' })
   }
+  if (data.length === 0) {
+    return res.status(404).json({ error: 'User not found' })
+  }
+  res.status(204).send()
 })
 
 const port = process.env.PORT || 3000
