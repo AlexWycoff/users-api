@@ -4,11 +4,50 @@ import cors from 'cors'
 import { createClient } from '@supabase/supabase-js'
 
 // Connect to Supabase. 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY)
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SECRET_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false }, // a server doesn't keep its own login
+})
 
 const app = express()
 app.use(cors()) 
 app.use(express.json())
+
+// Authentication
+async function getUserFromRequest(req) {
+  const header = req.headers.authorization
+  if (!header || !header.startsWith('Bearer ')) {
+    return null
+  }
+  const token = header.slice('Bearer '.length)
+  const { data, error } = await supabase.auth.getUser(token)
+  if (error) {
+    return null
+  }
+  return data.user
+}
+
+// Only let logged-in users through
+async function requireLogin(req, res, next) {
+  const user = await getUserFromRequest(req)
+  if (!user) {
+    return res.status(401).json({ error: 'You must be logged in' })
+  }
+  req.user = user
+  next()
+}
+
+// Only let admins through.
+async function requireAdmin(req, res, next) {
+  const user = await getUserFromRequest(req)
+  if (!user) {
+    return res.status(401).json({ error: 'You must be logged in' })
+  }
+  if (user.app_metadata.role !== 'admin') {
+    return res.status(403).json({ error: 'Admins only' })
+  }
+  req.user = user
+  next()
+}
 
 // GET /users: return every user
 app.get('/users', async (req, res) => {
@@ -21,7 +60,7 @@ app.get('/users', async (req, res) => {
 })
 
 // GET /users/profiles: every user joined with their profile
-app.get('/users/profiles', async (req, res) => {
+app.get('/users/profiles', requireLogin, async (req, res) => {
   const { data, error } = await supabase.from('users').select('*, user_profiles(*)').order('id')
   if (error) {
     console.error(error)
@@ -31,7 +70,7 @@ app.get('/users/profiles', async (req, res) => {
 })
 
 // POST /users: add a new user and their profile
-app.post('/users', async (req, res) => {
+app.post('/users', requireAdmin, async (req, res) => {
   const { first_name, last_name, email, major, graduation_year } = req.body
   const { bio, date_of_birth, profile_picture_url } = req.body
 
@@ -63,7 +102,7 @@ app.post('/users', async (req, res) => {
 })
 
 // PUT /users/:id: update a user and their profile
-app.put('/users/:id', async (req, res) => {
+app.put('/users/:id', requireAdmin, async (req, res) => {
   const id = req.params.id
   const { first_name, last_name, email, major, graduation_year } = req.body
   const { bio, date_of_birth, profile_picture_url } = req.body
@@ -99,7 +138,7 @@ app.put('/users/:id', async (req, res) => {
 })
 
 // DELETE /users/:id: remove a user (their profile and posts are removed too, by ON DELETE CASCADE)
-app.delete('/users/:id', async (req, res) => {
+app.delete('/users/:id', requireAdmin, async (req, res) => {
   const { data, error } = await supabase.from('users').delete().eq('id', req.params.id).select()
   if (error) {
     console.error(error)
